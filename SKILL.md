@@ -12,12 +12,19 @@ description: อ่านรายการออเดอร์จากเว�
 
 ---
 
-## การตั้งค่า Environment Variable บน VPS
-สคริปต์ใช้คุกกี้จากการล็อกอิน Shipnity โดยอ่านจากตัวแปร `SHIPNITY_COOKIE`:
+## การตั้งค่าการยืนยันตัวตนบน VPS (เลือกได้ 2 วิธี)
+
+### วิธีที่ 1: ใช้ Cookie จากเบราว์เซอร์ (`SHIPNITY_COOKIE`)
 ```bash
 export SHIPNITY_COOKIE="remember_user_token=<ค่าจากเบราว์เซอร์>; _shipnity_session=<ค่าจากเบราว์เซอร์>"
 ```
-*(แนะนำให้ใส่ไว้ในไฟล์ `.env` ของ Hermes หรือ `~/.bashrc` บน VPS โดยคุกกี้ `remember_user_token` จะทำหน้าที่ต่ออายุ Session อัตโนมัติ)*
+
+### วิธีที่ 2: ใช้ Email และ Password (`SHIPNITY_EMAIL` + `SHIPNITY_PASSWORD`)
+สคริปต์รองรับการล็อกอินผ่าน GraphQL `signInUser` อัตโนมัติหากตั้งค่า:
+```bash
+export SHIPNITY_EMAIL="your_email@example.com"
+export SHIPNITY_PASSWORD="your_password"
+```
 
 ---
 
@@ -25,17 +32,25 @@ export SHIPNITY_COOKIE="remember_user_token=<ค่าจากเบราว�
 
 สคริปต์หลักอยู่ที่: `~/.hermes/skills/shipnity-tracking/scripts/shipnity_tool.py`
 
-### 1. ดึงรายการออเดอร์จาก Shipnity
-* **ดึงเฉพาะออเดอร์ที่ "รอส่ง" (READY_TO_SHIP):**
+### 1. ดึงรายการออเดอร์จาก Shipnity (`orderList`)
+* **ดึงออเดอร์ล่าสุดทั้งหมด (50 รายการแรก):**
+  ```bash
+  python3 ~/.hermes/skills/shipnity-tracking/scripts/shipnity_tool.py list --status ALL --limit 50
+  ```
+* **ดึงเฉพาะออเดอร์ที่ยังไม่ปิดรายการ / รอส่ง (`READY_TO_SHIP`):**
   ```bash
   python3 ~/.hermes/skills/shipnity-tracking/scripts/shipnity_tool.py list --status READY_TO_SHIP --limit 50
   ```
-* **ดึงออเดอร์ทั้งหมด (ALL) หรือค้นหาจากชื่อ/เลขออเดอร์ (เช่น DN92):**
+* **ค้นหาออเดอร์จากเลขใบสั่งซื้อ ชื่อลูกค้า หรือเบอร์โทร (เช่น `DN92`):**
   ```bash
-  python3 ~/.hermes/skills/shipnity-tracking/scripts/shipnity_tool.py list --status ALL --search "DN92"
+  python3 ~/.hermes/skills/shipnity-tracking/scripts/shipnity_tool.py list --search "DN92"
+  ```
+* **ดึงออเดอร์ตาม Internal Order ID (เช่น `136430164`):**
+  ```bash
+  python3 ~/.hermes/skills/shipnity-tracking/scripts/shipnity_tool.py list --id "136430164"
   ```
 
-### 2. กรอกเลขพัสดุ (Tracking Number) ลงในออเดอร์
+### 2. กรอกเลขพัสดุ (Tracking Number) ลงในออเดอร์ (`closedNote`)
 * **กรณีออเดอร์อยู่สถานะ "รอส่ง" และต้องการใส่เลขพัสดุพร้อมเปลี่ยนสถานะเป็น "ส่งแล้ว" (`--mode close`):**
   ```bash
   python3 ~/.hermes/skills/shipnity-tracking/scripts/shipnity_tool.py set-tracking \
@@ -45,7 +60,7 @@ export SHIPNITY_COOKIE="remember_user_token=<ค่าจากเบราว�
     --mode close
   ```
   *(หมายเหตุ: `<ORDER_ID>` คือฟิลด์ `id` ที่ได้จากคำสั่ง `list` เช่น `136430164` ไม่ใช่ `invoiceNumber`)*
-* **กรณีออเดอร์ปิดรายการไปแล้ว แต่ต้องการแก้ไขเฉพาะเลขพัสดุ (`--mode update`):**
+* **กรณีออเดอร์ปิดรายการไปแล้ว (`status: "CLOSE"`) แต่ต้องการเพิ่มหรือแก้ไขเฉพาะเลขพัสดุ (`--mode update`):**
   ```bash
   python3 ~/.hermes/skills/shipnity-tracking/scripts/shipnity_tool.py set-tracking \
     --order-id "<ORDER_ID>" \
@@ -74,13 +89,15 @@ export SHIPNITY_COOKIE="remember_user_token=<ค่าจากเบราว�
 1. **อ่านข้อมูลจากไฟล์ใบเสร็จ (Extract):**
    * หากเป็นไฟล์รูปภาพ: ใช้ความสามารถ Vision หรือ OCR อ่านรายชื่อผู้รับ, เบอร์โทรศัพท์, รหัสไปรษณีย์, ค่าส่ง (ถ้ามี) และ **เลขพัสดุ (Tracking Number)** ทุกบรรทัด
    * หากเป็นไฟล์ PDF: ใช้ `pdftotext` หรือ `python3 -c "import fitz; ..."` (PyMuPDF) หรือ `pdfplumber` เพื่อดึงข้อความทั้งหมดออกมา
-2. **ดึงรายการออเดอร์ที่รอส่ง (Fetch Pending Orders):**
-   * รันคำสั่ง `shipnity_tool.py list --status READY_TO_SHIP --limit 50` (หากไม่เจอใน `READY_TO_SHIP` ให้ลองดึง `--status ALL --limit 50`)
+2. **ดึงรายการออเดอร์จาก Shipnity:**
+   * รันคำสั่ง `shipnity_tool.py list --status ALL --limit 50` (หรือใช้ `--search "<ชื่อหรือเบอร์โทร>"` หากต้องการค้นหาเฉพาะเจาะจง)
 3. **จับคู่ข้อมูลอัจฉริยะ (Smart Matching):**
-   * นำรายชื่อผู้รับ/เบอร์โทร/รหัสไปรษณีย์จากใบเสร็จ มาเทียบกับ `customer.name`, `customer.tel`, `customer.address` หรือ `invoiceNumber` ของออเดอร์ใน Shipnity
-   * คำนึงถึงว่าชื่อในใบเสร็จอาจสะกดย่อหรือมีคำนำหน้าต่างกันเล็กน้อย (เช่น `"คุณสมชาย"` กับ `"สมชาย ใจดี"`) ให้ใช้เบอร์โทรหรือรหัสไปรษณีย์ใน `address` ช่วยยืนยันความถูกต้อง
+   * นำรายชื่อผู้รับ/เบอร์โทร/รหัสไปรษณีย์จากใบเสร็จ มาเทียบกับ `name`, `tel`, `address`, `customer.name` หรือ `invoiceNumber` ของออเดอร์ใน Shipnity
+   * คำนึงถึงว่าชื่อในใบเสร็จอาจสะกดย่อหรือมีคำนำหน้าต่างกันเล็กน้อย ให้ใช้เบอร์โทรหรือรหัสไปรษณีย์ใน `address` ช่วยยืนยันความถูกต้อง
 4. **อัปเดตเลขพัสดุ (Update Tracking):**
-   * สำหรับรายการที่จับคู่ได้ชัดเจน ให้รัน `shipnity_tool.py set-tracking` เพื่อบันทึกเลขพัสดุทันที (เช็คก่อนว่า `shippop` เป็น `false` เพราะถ้า `shippop: true` จะเป็นขนส่งในระบบที่แก้ไขเลขพัสดุไม่ได้)
+   * ถ้ารายการนั้นยังไม่ปิดออเดอร์ (`closed: false`) ให้ใช้ `--mode close`
+   * ถ้ารายการนั้นปิดออเดอร์ไปแล้ว (`closed: true` / `status: "CLOSE"`) ให้ใช้ `--mode update`
+   * เช็คก่อนว่า `shippop` เป็น `false` (เพราะถ้า `shippop: true` จะเป็นขนส่งในระบบที่แก้ไขเลขพัสดุไม่ได้)
    * สำหรับรายการที่ไม่แน่ใจ (เช่น ชื่อซ้ำกันหลายออเดอร์ หรือหาออเดอร์ไม่เจอ) **ห้ามเดาสุ่ม** ให้เว้นไว้แล้วถามผู้ใช้ในแชท
 5. **สรุปผลตอบกลับผู้ใช้:**
    * แจ้งสรุปรายการที่อัปเดตสำเร็จ: `[เลขใบสั่งซื้อ] ชื่อลูกค้า -> เลขพัสดุ`

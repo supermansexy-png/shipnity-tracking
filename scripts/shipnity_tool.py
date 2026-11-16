@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Shipnity CLI Tool for Hermes Agent
-Supports reading orders, updating order/customer tags, and setting tracking numbers via Shipnity GraphQL API.
+Shipnity CLI Tool for Hermes Agent (Verified against live Shipnity GraphQL Schema)
+Supports:
+- Authentication via SHIPNITY_COOKIE or (SHIPNITY_EMAIL + SHIPNITY_PASSWORD)
+- Listing & searching orders (orderList -> nodes)
+- Closing orders & setting tracking numbers (closeOrder -> closedNote)
+- Updating order tags or tracking numbers (updateOrder -> tag, closedNote)
+- Updating customer tags (updateCustomer -> tags)
 """
 
 import argparse
 import datetime
-import http.cookiejar
 import json
 import os
 import sys
@@ -18,45 +22,139 @@ BASE_URL = "https://www.shipnity.com"
 GRAPHQL_URL = f"{BASE_URL}/api/graphql"
 CSRF_URL = f"{BASE_URL}/get_csrf_token"
 
+ORDER_LIST_QUERY = """
+query (
+  $perPage: Int
+  $page: Int
+  $ids: [ID!]
+  $search: String
+) {
+  orderList(
+    perPage: $perPage
+    page: $page
+    ids: $ids
+    search: $search
+  ) {
+    nodesCount
+    pagesCount
+    hasNextPage
+    nodes {
+      id
+      invoiceNumber
+      slug
+      name
+      tel
+      address
+      districtCode
+      price
+      shippingFee
+      paidAmount
+      unpaidAmount
+      status
+      closed
+      canClose
+      closedNote
+      shippingType
+      shippop
+      tag
+      createdAt
+      customer {
+        id
+        name
+        email
+        tags
+      }
+      purchases {
+        id
+        name
+        quantity
+        price
+      }
+    }
+  }
+}
+"""
+
+CLOSE_ORDER_MUTATION = """
+mutation ($input: CloseOrderInput!) {
+  closeOrder(input: $input) {
+    order {
+      id
+      invoiceNumber
+      closed
+      closedNote
+      status
+    }
+    errors
+  }
+}
+"""
+
+UPDATE_ORDER_MUTATION = """
+mutation ($input: UpdateOrderInput!) {
+  updateOrder(input: $input) {
+    order {
+      id
+      invoiceNumber
+      tag
+      closedNote
+      status
+    }
+    errors
+  }
+}
+"""
+
+UPDATE_CUSTOMER_MUTATION = """
+mutation ($input: UpdateCustomerInput!) {
+  updateCustomer(input: $input) {
+    customer {
+      id
+      name
+      tags
+    }
+    errors
+  }
+}
+"""
+
+SIGN_IN_MUTATION = """
+mutation ($input: SignInUserInput!) {
+  signInUser(input: $input) {
+    user {
+      id
+    }
+    errors
+  }
+}
+"""
+
 
 class ShipnityClient:
-    def __init__(self, cookie_str: str = None):
-        self.cookie_str = cookie_str or os.environ.get("SHIPNITY_COOKIE", "").strip()
-        if not self.cookie_str:
+    def __init__(self, cookie_str: str = None, email: str = None, password: str = None):
+        self.cookie_str = (cookie_str or os.environ.get("SHIPNITY_COOKIE", "")).strip()
+        self.email = (email or os.environ.get("SHIPNITY_EMAIL", "")).strip()
+        self.password = (password or os.environ.get("SHIPNITY_PASSWORD", "")).strip()
+        if not self.cookie_str and not (self.email and self.password):
             raise ValueError(
-                "Missing SHIPNITY_COOKIE environment variable. "
-                "Please set SHIPNITY_COOKIE='remember_user_token=...; _shipnity_session=...'"
+                "Missing credentials. Set SHIPNITY_COOKIE='remember_user_token=...; _shipnity_session=...' "
+                "or set both SHIPNITY_EMAIL and SHIPNITY_PASSWORD."
             )
         self.csrf_token = None
 
-    def _headers(self, include_csrf: bool = True) -> dict:
+    def _headers(self, include_csrf: bool = True, referer: str = f"{BASE_URL}/order/") -> dict:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/json",
             "Origin": BASE_URL,
-            "Referer": f"{BASE_URL}/order/",
-            "Cookie": self.cookie_str,
+            "Referer": referer,
         }
+        if self.cookie_str:
+            headers["Cookie"] = self.cookie_str
         if include_csrf and self.csrf_token:
             headers["X-CSRF-Token"] = self.csrf_token
         return headers
-
-    def fetch_csrf_token(self) -> str:
-        req = urllib.request.Request(CSRF_URL, headers=self._headers(include_csrf=False), method="GET")
-        try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                # Update session cookie if server sent Set-Cookie
-                set_cookies = resp.headers.get_all("Set-Cookie") or []
-                self._merge_set_cookies(set_cookies)
-                data = json.loads(resp.read().decode("utf-8"))
-                self.csrf_token = data.get("csrf_token")
-                if not self.csrf_token:
-                    raise RuntimeError(f"Failed to get csrf_token from {CSRF_URL}: {data}")
-                return self.csrf_token
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"HTTP {e.code} when fetching CSRF token: {body}") from e
 
     def _merge_set_cookies(self, set_cookies: list):
         if not set_cookies:
@@ -73,66 +171,105 @@ class ShipnityClient:
                 cookie_map[k.strip()] = v.strip()
         self.cookie_str = "; ".join(f"{k}={v}" for k, v in cookie_map.items())
 
-    def graphql(self, query: str, variables: dict = None) -> dict:
+    def fetch_csrf_token(self) -> str:
+        req = urllib.request.Request(CSRF_URL, headers=self._headers(include_csrf=False), method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                set_cookies = resp.headers.get_all("Set-Cookie") or []
+                self._merge_set_cookies(set_cookies)
+                data = json.loads(resp.read().decode("utf-8"))
+                # Shipnity /get_csrf_token returns {"token": "..."}
+                self.csrf_token = data.get("token") or data.get("csrf_token")
+                if not self.csrf_token:
+                    raise RuntimeError(f"Failed to extract token from {CSRF_URL}: {data}")
+                return self.csrf_token
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"HTTP {e.code} when fetching CSRF token: {body}") from e
+
+    def login_if_needed(self):
         if not self.csrf_token:
             self.fetch_csrf_token()
-        payload = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
+        if not self.cookie_str and self.email and self.password:
+            payload = json.dumps(
+                {
+                    "operationName": None,
+                    "variables": {"input": {"email": self.email, "password": self.password}},
+                    "query": SIGN_IN_MUTATION,
+                }
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                GRAPHQL_URL,
+                data=payload,
+                headers=self._headers(include_csrf=True, referer=f"{BASE_URL}/authen/"),
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                set_cookies = resp.headers.get_all("Set-Cookie") or []
+                self._merge_set_cookies(set_cookies)
+                res_data = json.loads(resp.read().decode("utf-8"))
+                errors = ((res_data.get("data") or {}).get("signInUser") or {}).get("errors")
+                if errors:
+                    raise RuntimeError(f"Login failed: {errors}")
+            # Refresh CSRF token after login session change
+            self.fetch_csrf_token()
+
+    def graphql(self, query: str, variables: dict = None) -> dict:
+        self.login_if_needed()
+        payload = json.dumps({"operationName": None, "query": query, "variables": variables or {}}).encode("utf-8")
         req = urllib.request.Request(GRAPHQL_URL, data=payload, headers=self._headers(include_csrf=True), method="POST")
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
+                set_cookies = resp.headers.get_all("Set-Cookie") or []
+                self._merge_set_cookies(set_cookies)
                 raw = resp.read().decode("utf-8")
-                return json.loads(raw)
+                res = json.loads(raw)
+                if res.get("errors"):
+                    raise RuntimeError(f"GraphQL execution errors: {res['errors']}")
+                return res
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="ignore")
             raise RuntimeError(f"HTTP {e.code} from GraphQL API: {body}") from e
 
-    def list_orders(self, status: str = "READY_TO_SHIP", limit: int = 50, search: str = None) -> list:
-        query = """
-        query orderList($first: Int, $query: OrderQueryInput, $filter: OrderFilterInput) {
-          orderList(first: $first, query: $query, filter: $filter) {
-            edges {
-              node {
-                id
-                slug
-                invoiceNumber
-                status
-                currentStateForm
-                tag
-                closedNote
-                closedCost
-                closedAt
-                shippingType
-                shippop
-                price
-                shippingFee
-                paidAmount
-                unpaidAmount
-                createdAt
-                customer {
-                  id
-                  name
-                  tel
-                  address
-                  tags
-                }
-                purchases {
-                  id
-                  name
-                  quantity
-                  price
-                }
-              }
-            }
-          }
+    def list_orders(
+        self,
+        status: str = "ALL",
+        limit: int = 50,
+        page: int = 1,
+        search: str = None,
+        order_ids: list = None,
+    ) -> dict:
+        variables = {
+            "perPage": int(limit),
+            "page": int(page),
         }
-        """
-        q_input = {"status": status, "sort": "CREATED_AT_DESC"}
         if search:
-            q_input["search"] = search
+            variables["search"] = str(search).strip()
+        if order_ids:
+            variables["ids"] = [str(i).strip() for i in order_ids]
 
-        res = self.graphql(query, {"first": limit, "query": q_input, "filter": {}})
-        edges = (((res.get("data") or {}).get("orderList") or {}).get("edges")) or []
-        return [edge["node"] for edge in edges if edge and edge.get("node")]
+        res = self.graphql(ORDER_LIST_QUERY, variables)
+        order_list_data = (res.get("data") or {}).get("orderList") or {}
+        nodes = order_list_data.get("nodes") or []
+
+        # Client-side filter if status specified (e.g. READY_TO_SHIP, CLOSE, TRANSFER, OPEN)
+        if status and status.upper() != "ALL":
+            target = status.upper()
+            if target in ("READY_TO_SHIP", "UNCLOSED", "PENDING"):
+                nodes = [
+                    n
+                    for n in nodes
+                    if not n.get("closed")
+                    and (n.get("status") in ("READY_TO_SHIP", "TRANSFER", "PACKING", "OPEN") or n.get("canClose"))
+                ]
+            else:
+                nodes = [n for n in nodes if (n.get("status") or "").upper() == target]
+
+        return {
+            "total_in_query": order_list_data.get("nodesCount", len(nodes)),
+            "count": len(nodes),
+            "orders": nodes,
+        }
 
     def set_tracking(
         self,
@@ -143,21 +280,6 @@ class ShipnityClient:
         send_auto_message: bool = False,
     ) -> dict:
         if close_order:
-            mutation = """
-            mutation closeOrder($input: CloseOrderInput!) {
-              closeOrder(input: $input) {
-                order {
-                  id
-                  invoiceNumber
-                  status
-                  closedNote
-                  closedCost
-                  closedAt
-                }
-                errors
-              }
-            }
-            """
             tz_th = datetime.timezone(datetime.timedelta(hours=7))
             now_iso = datetime.datetime.now(tz_th).isoformat(timespec="seconds")
             variables = {
@@ -169,60 +291,23 @@ class ShipnityClient:
                     "sendAutoMessage": bool(send_auto_message),
                 }
             }
-            return self.graphql(mutation, variables)
+            return self.graphql(CLOSE_ORDER_MUTATION, variables)
         else:
-            mutation = """
-            mutation updateOrder($input: UpdateOrderInput!) {
-              updateOrder(input: $input) {
-                order {
-                  id
-                  invoiceNumber
-                  status
-                  closedNote
-                }
-                errors
-              }
-            }
-            """
             variables = {
                 "input": {
                     "id": str(order_id),
                     "closedNote": tracking_number.strip(),
                 }
             }
-            return self.graphql(mutation, variables)
+            return self.graphql(UPDATE_ORDER_MUTATION, variables)
 
     def set_order_tag(self, order_id: str, tag: str) -> dict:
-        mutation = """
-        mutation updateOrder($input: UpdateOrderInput!) {
-          updateOrder(input: $input) {
-            order {
-              id
-              invoiceNumber
-              tag
-            }
-            errors
-          }
-        }
-        """
         variables = {"input": {"id": str(order_id), "tag": tag.strip()}}
-        return self.graphql(mutation, variables)
+        return self.graphql(UPDATE_ORDER_MUTATION, variables)
 
     def set_customer_tags(self, customer_id: str, tags: list) -> dict:
-        mutation = """
-        mutation updateCustomer($input: UpdateCustomerInput!) {
-          updateCustomer(input: $input) {
-            customer {
-              id
-              name
-              tags
-            }
-            errors
-          }
-        }
-        """
-        variables = {"input": {"id": str(customer_id), "tags": tags}}
-        return self.graphql(mutation, variables)
+        variables = {"input": {"id": str(customer_id), "customerCategoryId": None, "tags": tags}}
+        return self.graphql(UPDATE_CUSTOMER_MUTATION, variables)
 
 
 def main():
@@ -230,14 +315,16 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # list command
-    p_list = subparsers.add_parser("list", help="List orders from Shipnity")
+    p_list = subparsers.add_parser("list", help="List or search orders from Shipnity")
     p_list.add_argument(
         "--status",
-        default="READY_TO_SHIP",
-        help="Order status filter: READY_TO_SHIP, ALL, TRANSFER, CLOSE, etc. (default: READY_TO_SHIP)",
+        default="ALL",
+        help="Filter by status: ALL, READY_TO_SHIP, CLOSE, TRANSFER, OPEN (default: ALL)",
     )
-    p_list.add_argument("--limit", type=int, default=50, help="Number of orders to fetch (default: 50)")
-    p_list.add_argument("--search", default=None, help="Optional search keyword (invoice, name, phone, slug)")
+    p_list.add_argument("--limit", type=int, default=50, help="Number of orders per page (default: 50)")
+    p_list.add_argument("--page", type=int, default=1, help="Page number (default: 1)")
+    p_list.add_argument("--search", default=None, help="Search keyword (invoice e.g. DN92, customer name, tel)")
+    p_list.add_argument("--id", default=None, help="Specific internal Order ID (e.g. 136430164)")
 
     # set-tracking command
     p_track = subparsers.add_parser("set-tracking", help="Set tracking number (closedNote) on an order")
@@ -248,7 +335,7 @@ def main():
         "--mode",
         choices=["close", "update"],
         default="close",
-        help="'close' transitions order to shipped (closeOrder); 'update' only edits closedNote (updateOrder)",
+        help="'close' closes order & sets tracking (closeOrder); 'update' only edits closedNote (updateOrder)",
     )
     p_track.add_argument(
         "--notify",
@@ -268,8 +355,15 @@ def main():
     try:
         client = ShipnityClient()
         if args.command == "list":
-            orders = client.list_orders(status=args.status, limit=args.limit, search=args.search)
-            print(json.dumps({"ok": True, "count": len(orders), "orders": orders}, ensure_ascii=False, indent=2))
+            ids = [args.id] if args.id else None
+            data = client.list_orders(
+                status=args.status,
+                limit=args.limit,
+                page=args.page,
+                search=args.search,
+                order_ids=ids,
+            )
+            print(json.dumps({"ok": True, **data}, ensure_ascii=False, indent=2))
 
         elif args.command == "set-tracking":
             close_mode = args.mode == "close"
